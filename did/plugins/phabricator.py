@@ -63,32 +63,19 @@ class Phabricator:
                    this is not possible.
         """
         if self._login_phids is None or self._login_phids == []:
-            self._login_phids = self._resolve_logins_to_phids(self.logins)
+            log.debug("Resolving logins to Phabricator PHIDs: %s", self.logins)
+            # Resolve logins to phids for users
+            # see https://reviews.llvm.org/conduit/method/user.search/
+            url = self.url + "/user.search"
+            data_dict = {
+                'api.token': self.token,
+                }
+            for idx, login in enumerate(self.logins):
+                data_dict[f'constraints[usernames][{idx}]'] = login
+
+            results = self._get_all_pages(url, data_dict)
+            self._login_phids = [user["phid"] for user in results]
         return self._login_phids
-
-    def _resolve_logins_to_phids(self, logins: List[str]) -> List[str]:
-        """
-        Resolves the given login usernames to phabricator PHIDs and
-        returns those PHIDs as a list of strings.
-
-        Keyword Arguments:
-            logins List[str]: The list of usernames to resolve to PHIDs
-
-        Returns:
-            List[str]: The phabricator PHIDs for the login names
-        """
-        log.debug("Resolving logins to Phabricator PHIDs: %s", logins)
-        # Resolve logins to phids for users
-        # see https://reviews.llvm.org/conduit/method/user.search/
-        url = self.url + "/user.search"
-        data_dict = {
-            'api.token': self.token,
-            }
-        for idx, login in enumerate(logins):
-            data_dict[f'constraints[usernames][{idx}]'] = login
-
-        results = self._get_all_pages(url, data_dict)
-        return [user["phid"] for user in results]
 
     def search_diffs(self, data_dict: Dict[str, Any],
                      verbose: bool = False) -> List["Differential"]:
