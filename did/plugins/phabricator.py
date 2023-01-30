@@ -22,6 +22,8 @@ https://reviews.llvm.org/conduit/method/differential.revision.search/.
 
 """
 
+import datetime
+from enum import Enum
 from typing import Any, Dict, List
 
 import requests
@@ -30,11 +32,6 @@ from did.base import Config, ConfigError, ReportError, get_token
 from did.stats import Stats, StatsGroup
 from did.utils import listed, log, pretty
 
-# Number of differentials to be fetched per page
-# See "Paging and Limits" section here for example:
-# https://reviews.llvm.org/conduit/method/differential.revision.search/
-PER_PAGE = 100
-
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #  Investigator
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -42,6 +39,11 @@ PER_PAGE = 100
 
 class Phabricator:
     """ Phabricator Investigator """
+
+    # Maximum number of entries to be fetched per page
+    # See "Paging and Limits" section here for example:
+    # https://reviews.llvm.org/conduit/method/differential.revision.search/
+    MAX_PAGE_SIZE = 100
 
     def __init__(self, url, token, logins):
         """ Initialize url and headers """
@@ -67,9 +69,7 @@ class Phabricator:
             # Resolve logins to phids for users
             # see https://reviews.llvm.org/conduit/method/user.search/
             url = self.url + "/user.search"
-            data_dict = {
-                'api.token': self.token,
-                }
+            data_dict = {}
             for idx, login in enumerate(self.logins):
                 data_dict[f'constraints[usernames][{idx}]'] = login
 
@@ -77,20 +77,55 @@ class Phabricator:
             self._login_phids = [user["phid"] for user in results]
         return self._login_phids
 
-    def search_diffs(self, data_dict: Dict[str, Any],
-                     verbose: bool = False) -> List["Differential"]:
+    def search_diffs(self,
+                     verbose: bool = False,
+                     since: datetime.date = None,
+                     until: datetime.date = None,
+                     author_phids: List[str] = None,
+                     reviewer_phids: List[str] = None) -> List["Differential"]:
         """ Find Phabricator Differentials """
         url = self.url + "/differential.revision.search"
         result = []
+        data_dict = {}
+        if author_phids is not None:
+            for idx, login in enumerate(author_phids):
+                data_dict[f'constraints[authorPHIDs][{idx}]'] = login
+        if reviewer_phids is not None:
+            for idx, login in enumerate(reviewer_phids):
+                data_dict[f'constraints[authorPHIDs][{idx}]'] = login
+        if since is not None:
+            data_dict['constraints[createdStart]'] = since.strftime("%s")
+        if until is not None:
+            data_dict['constraints[createdEnd]'] = until.strftime("%s")
         for diff in self._get_all_pages(url, data_dict):
             result.append(Differential(diff, verbose=verbose))
         log.data(pretty(result))
         return result
 
+    def search_transactions(self,
+                            diff_phid: str,
+                            author_phids: List[str] = None) -> List["TransactionEvent"]:
+        """
+        Returns all the transaction events for a given differential
+        object. If given you can search for events by certain authors
+        authors.
+        """
+        url = self.url + "/transaction.search"
+        data_dict = {}
+        data_dict["objectIdentifier"] = diff_phid
+        if author_phids is not None:
+            for idx, login in enumerate(author_phids):
+                data_dict[f'constraints[authorPHIDs][{idx}]'] = login
+        events = self._get_all_pages(url, data_dict)
+        return [TransactionEvent(event) for event in events]
+
     def _get_all_pages(self, url: str, data_dict: Dict[str, Any]):
         """
-        Gets all pages of a Phabricator Conduit API request
+        Gets all pages of a Phabricator Conduit API request; given that
+        the API is pageable.
         """
+        if data_dict is None:
+            data_dict = {}
         data_dict['after'] = None
         results = []
         while True:
@@ -112,8 +147,12 @@ class Phabricator:
         """
         Gets a single page of a Phabricator Conduit API request
         """
-        data_dict['limit'] = PER_PAGE
-        data_dict['api.token'] = self.token
+        if data_dict is None:
+            data_dict = {}
+        if "limit" not in data_dict:
+            data_dict['limit'] = Phabricator.MAX_PAGE_SIZE
+        if "api.token" not in data_dict:
+            data_dict['api.token'] = self.token
         try:
             response = requests.post(url, data=data_dict)
             log.debug("Response headers: %s", response.headers)
@@ -187,18 +226,189 @@ class Differential:  # pylint: disable=too-few-public-methods
     """
 
     def __init__(self, data, verbose: bool = False):
+        self._data = data
         if verbose:
             self.str = f'{data["fields"]["uri"]} {data["fields"]["title"]}'
         else:
             self.str = f'D{data["id"]} {data["fields"]["title"]}'
+
+    @property
+    def phid(self) -> str:
+        """
+        Returns the Phabricator ID for the differential as a string
+        """
+        return self._data["phid"]
 
     def __str__(self):
         """ String representation """
         return self.str
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#  TransactionEvent
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class EventType(Enum):
+    """
+    EventType defines what type of transaction events we support.
+    """
+    COMMENT = "comment"
+    INLINE = "inline"
+    CREATE = "create"
+    CLOSE = "close"
+    UPDATE = "update"
+    SUMMARY = "summary"
+    TITLE = "title"
+    PROJECTS = "projects"
+    REQUEST_REVIEW = "request-review"
+    REVIEWERS = "reviewers"
+    SUBSCRIBERS = "subscribers"
+    STATUS = "status"
+    UNDEFINED = ""
+
+    def __str__(self):
+        """ String representation """
+        return self.value
+
+
+class TransactionEvent:  # pylint: disable=too-few-public-methods
+    """
+    Phabricator Transaction event.
+
+    See https://reviews.llvm.org/conduit/method/transaction.search/.
+
+    Here're examples::
+
+        {
+            "id": 4077171,
+            "phid": "PHID-XACT-DREV-7grkcftntvxf24c",
+            "type": "create",
+            "authorPHID": "PHID-USER-m46saogacat2jslbykue",
+            "objectPHID": "PHID-DREV-ypgxje4hhhdefuy4d6sz",
+            "dateCreated": 1674573526,
+            "dateModified": 1674573526,
+            "groupID": "dr3e2g6tx6ztr6zivk343kytk7uk7yng",
+            "comments": [],
+            "fields": {}
+        }
+
+        {
+            "id": 4077175,
+            "phid": "PHID-XACT-DREV-zconyio2dw2y7ne",
+            "type": "reviewers",
+            "authorPHID": "PHID-USER-m46saogacat2jslbykue",
+            "objectPHID": "PHID-DREV-ypgxje4hhhdefuy4d6sz",
+            "dateCreated": 1674573526,
+            "dateModified": 1674573526,
+            "groupID": "dr3e2g6tx6ztr6zivk343kytk7uk7yng",
+            "comments": [],
+            "fields": {
+                "operations": [
+                {
+                    "operation": "add",
+                    "phid": "PHID-USER-aigeqxvzdke5r36hodix",
+                    "oldStatus": null,
+                    "newStatus": "added",
+                    "isBlocking": false
+                },
+                {
+                    "operation": "add",
+                    "phid": "PHID-USER-7rdtwvftotyrjl5bf7gy",
+                    "oldStatus": null,
+                    "newStatus": "added",
+                    "isBlocking": false
+                },
+                {
+                    "operation": "add",
+                    "phid": "PHID-USER-icssaf6rtj6ahq4lchay",
+                    "oldStatus": null,
+                    "newStatus": "added",
+                    "isBlocking": false
+                }
+                ]
+            }
+        },
+
+    """
+
+    def __init__(self, data):
+        self._data = data
+        self._type = self._data["type"]
+        self._author_phid = self._data["authorPHID"]
+
+    def is_in_date_range(self, since: datetime.date = None,
+                         until: datetime.date = None) -> bool:
+        """
+        Returns true if the event happend in the given timestamp range,
+        including the boundaries.
+        """
+        date_modified = datetime.date.fromtimestamp(self._data["dateModified"])
+        if since is not None:
+            if not date_modified >= since:
+                return False
+        if until is not None:
+            if not date_modified <= until:
+                return False
+        return True
+
+    def is_type(self, typ: EventType) -> bool:
+        """
+        Returns true if the transaction refers to an event of the given
+        type.
+        """
+        if typ == EventType.UNDEFINED:
+            if self._type is None or self._type == "":
+                return True
+            return False
+        return self._type == str(typ)
+
+    @property
+    def event_type(self) -> EventType:
+        """ Returns the type of event """
+        return self._type
+
+    @property
+    def author_phid(self) -> str:
+        """ Returns the author's PHID """
+        return self._author_phid
+
+    def __str__(self):
+        """ String representation """
+        return f"{self.author_phid} - {self.event_type} - {self._data['dateModified']}"
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #  Stats
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+
+class DifferentialsCommented(Stats):
+    """ Differentials commented """
+
+    def fetch(self):
+        log.info("Searching for differentials commented by '%s'.", self.user)
+
+        diffs = self.parent.phabricator.search_diffs(
+            verbose=self.options.verbose,
+            since=self.options.since.date,
+            until=self.options.until.date,
+            author_phids=self.parent.phabricator.login_phids)
+        # Filter out those diffs where there's a comment transaction
+        commented_diffs = []
+        closed_diffs = []
+        for diff in diffs:
+            events = self.parent.phabricator.search_transactions(
+                diff_phid=diff.phid, author_phids=self.parent.phabricator.login_phids)
+            for event in events:
+                if not event.is_in_date_range(
+                        self.options.since.date,
+                        self.options.until.date):
+                    print("out of date")
+                    continue
+                if event.is_type(EventType.COMMENT) or event.is_type(EventType.INLINE):
+                    commented_diffs.append(diff)
+                elif event.is_type(EventType.CLOSE):
+                    closed_diffs.append(diff)
+        self.stats = commented_diffs
 
 
 class DifferentialsCreated(Stats):
@@ -264,10 +474,13 @@ class PhabricatorStats(StatsGroup):
         self.phabricator = Phabricator(self.url, self.token, self.logins)
         # Create the list of stats
         self.stats = [
+            DifferentialsCommented(
+                option=option + "-differentials-commented", parent=self,
+                name=f"Differentials commented on {option}"),
             DifferentialsCreated(
                 option=option + "-differentials-created", parent=self,
-                name=f"Reviews created on {option}"),
+                name=f"Differentials created on {option}"),
             DifferentialsReviewed(
                 option=option + "-differentials-reviewed", parent=self,
-                name=f"Reviews participated on {option}"),
+                name=f"Differentials participated on {option}"),
             ]
